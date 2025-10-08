@@ -16,5 +16,4 @@ openpyxl
 tabulate
 
 google-generativeai
-pandas
-openpyxl
+
