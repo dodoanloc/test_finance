@@ -1,331 +1,402 @@
-# python.py
+import io
+import unicodedata
+from datetime import datetime
 
-import streamlit as st
+import numpy as np
 import pandas as pd
-import google.generativeai as genai
-from google.api_core.exceptions import GoogleAPIError
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-import io  # Để export file
+import streamlit as st
+import altair as alt
+from google import genai
+from google.genai.errors import APIError
 
-# --- Cấu hình Trang Streamlit ---
-st.set_page_config(
-    page_title="App Phân Tích Báo Cáo Tài Chính",
-    layout="wide"
-)
-
+# ------------------------
+# Page setup
+# ------------------------
+st.set_page_config(page_title="App Phân Tích Báo Cáo Tài Chính", layout="wide")
 st.title("Ứng dụng Phân Tích Báo Cáo Tài Chính 📊")
 
-# --- Khởi tạo Session State cho Chat ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "df_processed" not in st.session_state:
-    st.session_state.df_processed = None
-if "data_for_ai" not in st.session_state:
-    st.session_state.data_for_ai = None
-if "thanh_toan_hien_hanh_N_1" not in st.session_state:
-    st.session_state.thanh_toan_hien_hanh_N_1 = "N/A"
-if "thanh_toan_hien_hanh_N" not in st.session_state:
-    st.session_state.thanh_toan_hien_hanh_N = "N/A"
+# ------------------------
+# Helpers
+# ------------------------
 
-# --- Hàm tính toán chính (Sử dụng Caching để Tối ưu hiệu suất) ---
-@st.cache_data
-def process_financial_data(df):
-    """Thực hiện các phép tính Tăng trưởng và Tỷ trọng."""
-    
-    # Đảm bảo các giá trị là số để tính toán
-    numeric_cols = ['Năm trước', 'Năm sau']
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    # 1. Tính Tốc độ Tăng trưởng
-    df['Tốc độ tăng trưởng (%)'] = (
-        (df['Năm sau'] - df['Năm trước']) / df['Năm trước'].replace(0, 1e-9)
-    ) * 100
+def normalize_vn(text: str) -> str:
+    """Remove Vietnamese diacritics, collapse spaces, and upper-case for robust matching."""
+    if text is None:
+        return ""
+    txt = unicodedata.normalize("NFD", str(text))
+    txt = "".join(ch for ch in txt if unicodedata.category(ch) != "Mn")
+    return " ".join(txt.split()).upper()
 
-    # 2. Tính Tỷ trọng theo Tổng Tài sản
-    tong_tai_san_row = df[df['Chỉ tiêu'].str.contains('TỔNG CỘNG TÀI SẢN', case=False, na=False)]
-    
-    if tong_tai_san_row.empty:
-        raise ValueError("Không tìm thấy chỉ tiêu 'TỔNG CỘNG TÀI SẢN'.")
 
-    tong_tai_san_N_1 = tong_tai_san_row['Năm trước'].iloc[0]
-    tong_tai_san_N = tong_tai_san_row['Năm sau'].iloc[0]
+def safe_div(numer, denom, default=np.nan):
+    denom = np.where(denom == 0, np.nan, denom)
+    out = numer / denom
+    return np.where(np.isfinite(out), out, default)
 
-    # Xử lý lỗi chia cho 0 thủ công
-    divisor_N_1 = tong_tai_san_N_1 if tong_tai_san_N_1 != 0 else 1e-9
-    divisor_N = tong_tai_san_N if tong_tai_san_N != 0 else 1e-9
 
-    df['Tỷ trọng Năm trước (%)'] = (df['Năm trước'] / divisor_N_1) * 100
-    df['Tỷ trọng Năm sau (%)'] = (df['Năm sau'] / divisor_N) * 100
-    
-    return df
+RE_TOTAL_ASSETS = normalize_vn("TỔNG CỘNG TÀI SẢN")
+RE_CA = normalize_vn("TÀI SẢN NGẮN HẠN")
+RE_CL = normalize_vn("NỢ NGẮN HẠN")
 
-# --- Hàm gọi API Gemini cho Phân tích Ban đầu ---
-def get_ai_analysis(data_for_ai, api_key):
-    """Gửi dữ liệu phân tích đến Gemini API và nhận nhận xét."""
+# ------------------------
+# Core processing
+# ------------------------
+@st.cache_data(show_spinner=False)
+def process_financial_data(df: pd.DataFrame, col_prev: str, col_curr: str) -> pd.DataFrame:
+    """Compute growth and structure weights between two chosen period columns.
+    Requires columns: Chỉ tiêu | <period columns>.
+    """
+    if "Chỉ tiêu" not in df.columns:
+        raise ValueError("Thiếu cột 'Chỉ tiêu'.")
+    for c in [col_prev, col_curr]:
+        if c not in df.columns:
+            raise ValueError(f"Thiếu cột kỳ dữ liệu: {c}")
+
+    df = df.copy()
+
+    # Ensure numeric for selected columns
+    for col in [col_prev, col_curr]:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # Helper key for matching
+    df["_KEY"] = df["Chỉ tiêu"].map(normalize_vn)
+
+    # Growth %
+    df["Tốc độ tăng trưởng (%)"] = safe_div(df[col_curr] - df[col_prev], df[col_prev]) * 100
+
+    # Structure weights relative to Total Assets (for each selected period)
+    tot_row = df.loc[df["_KEY"] == RE_TOTAL_ASSETS]
+    if tot_row.empty:
+        raise ValueError("Không tìm thấy chỉ tiêu 'TỔNG CỘNG TÀI SẢN'. Hãy đảm bảo tiêu đề đúng chính tả.")
+
+    tot_prev = float(tot_row[col_prev].iloc[0])
+    tot_curr = float(tot_row[col_curr].iloc[0])
+
+    df[f"Tỷ trọng {col_prev} (%)"] = safe_div(df[col_prev], tot_prev, default=np.nan) * 100
+    df[f"Tỷ trọng {col_curr} (%)"] = safe_div(df[col_curr], tot_curr, default=np.nan) * 100
+
+    return df.drop(columns=["_KEY"])  # hide helper column
+
+
+# ------------------------
+# Gemini helpers
+# ------------------------
+def get_ai_analysis(data_for_ai: str, api_key: str) -> str:
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',  # Sử dụng model ổn định, thay vì 2.5 nếu chưa ra
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.7,
-                top_p=0.8,
-                max_output_tokens=1000,
-            ),
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            }
-        ) 
-
-        # Prompt cải thiện: Thêm so sánh benchmark ngành (giả sử ngành sản xuất)
+        client = genai.Client(api_key=api_key)
+        model_name = "gemini-2.5-flash"
         prompt = f"""
-        Bạn là một chuyên gia phân tích tài chính chuyên nghiệp. Dựa trên các chỉ số tài chính sau của doanh nghiệp (ngành sản xuất), hãy đưa ra một nhận xét khách quan, ngắn gọn (khoảng 3-4 đoạn) về tình hình tài chính. 
-        Đánh giá tập trung vào tốc độ tăng trưởng, thay đổi cơ cấu tài sản và khả năng thanh toán hiện hành. 
-        So sánh với benchmark ngành: Tăng trưởng tài sản > 10% là tốt; Thanh toán hiện hành > 1.5 lần là an toàn; Tỷ trọng tài sản ngắn hạn > 30% là cân bằng.
-        
-        Dữ liệu thô và chỉ số:
+        Bạn là chuyên gia phân tích tài chính. Dựa trên các chỉ số sau, hãy đưa ra nhận xét khách quan, ngắn gọn (3–4 đoạn) về: tốc độ tăng trưởng, thay đổi cơ cấu tài sản, và khả năng thanh toán hiện hành.
+
+        Dữ liệu đầu vào:
         {data_for_ai}
         """
-
-        response = model.generate_content(prompt)
-        return response.text
-
-    except GoogleAPIError as e:
-        return f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API hoặc giới hạn sử dụng. Chi tiết lỗi: {e}"
+        resp = client.models.generate_content(model=model_name, contents=prompt)
+        return getattr(resp, "text", "Không nhận được văn bản phản hồi từ mô hình.")
+    except APIError as e:
+        return f"Lỗi gọi Gemini API: kiểm tra Khóa API hoặc giới hạn sử dụng. Chi tiết: {e}"
     except Exception as e:
-        return f"Đã xảy ra lỗi không xác định: {e}"
+        return f"Đã xảy ra lỗi không xác định khi gọi Gemini: {e}"
 
-# --- Hàm gọi API Gemini cho Chat ---
-def get_ai_chat_response(messages, api_key, df_context=None):
-    """Gửi lịch sử chat đến Gemini và nhận phản hồi, với ngữ cảnh dữ liệu nếu có."""
+
+def gemini_chat(user_message: str, history: list, api_key: str) -> str:
+    """Simple chat wrapper using history as context."""
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
-            generation_config=genai.types.GenerationConfig(
-                temperature=0.7,
-                top_p=0.8,
-                max_output_tokens=500,
-            ),
-            safety_settings={
-                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
-            }
+        client = genai.Client(api_key=api_key)
+        model_name = "gemini-2.5-flash"
+        sys_prompt = (
+            "Bạn là trợ lý phân tích tài chính. Trả lời bằng tiếng Việt, rõ ràng, súc tích, có cấu trúc đầu mục khi phù hợp."
         )
-
-        # Xây dựng prompt từ lịch sử chat (sửa lỗi syntax: đóng f-string đúng cách, dùng tiếng Việt)
-        chat_history = ""
-        for msg in messages:
-            role = "Người dùng" if msg["role"] == "user" else "Trợ lý"
-            chat_history += f"{role}: {msg['content']}\n"
-
-        # Thêm ngữ cảnh dữ liệu nếu có
-        if df_context is not None:
-            context = f"""
-            Ngữ cảnh dữ liệu tài chính (Bảng phân tích):
-            {df_context}
-            """
-        else:
-            context = ""
-
-        prompt = f"""
-        Bạn là một trợ lý AI chuyên về phân tích tài chính. Hãy trả lời câu hỏi của người dùng một cách chuyên nghiệp, ngắn gọn và dựa trên dữ liệu nếu có. 
-        Nếu câu hỏi liên quan đến dữ liệu tài chính, hãy tham chiếu đến ngữ cảnh sau:
-        {context}
-        
-        Lịch sử chat:
-        {chat_history}
-        
-        Câu hỏi hiện tại: {messages[-1]['content']}
-        """
-
-        response = model.generate_content(prompt)
-        return response.text
-
-    except GoogleAPIError as e:
-        return f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API hoặc giới hạn sử dụng. Chi tiết lỗi: {e}"
+        # Build a single contents string with brief history
+        ctx = [f"Người dùng: {m['user']}\nTrợ lý: {m['ai']}" for m in history if m.get('ai')]
+        context_blob = "\n\n".join(ctx)
+        content = f"{sys_prompt}\n\nNgữ cảnh hội thoại trước:\n{context_blob}\n\nTin nhắn mới của người dùng:\n{user_message}"
+        resp = client.models.generate_content(model=model_name, contents=content)
+        return getattr(resp, "text", "")
     except Exception as e:
-        return f"Đã xảy ra lỗi không xác định: {e}"
+        return f"(Lỗi khi gọi Gemini: {e})"
 
-# --- Chức năng 1: Tải File ---
+
+# ------------------------
+# Sidebar controls
+# ------------------------
+st.sidebar.header("⚙️ Tuỳ chọn")
+api_key = st.sidebar.text_input("Gemini API Key", type="password", value=st.secrets.get("GEMINI_API_KEY", ""))
+
+# ------------------------
+# UI — Sample template download
+# ------------------------
+with st.expander("📥 Tải file mẫu (Excel)"):
+    sample = pd.DataFrame(
+        {
+            "Chỉ tiêu": [
+                "TÀI SẢN NGẮN HẠN",
+                "TÀI SẢN DÀI HẠN",
+                "TỔNG CỘNG TÀI SẢN",
+                "NỢ NGẮN HẠN",
+                "NỢ DÀI HẠN",
+                "VỐN CHỦ SỞ HỮU",
+            ],
+            "2023": [5000, 7000, 12000, 3000, 2000, 7000],
+            "2024": [6500, 7500, 14000, 3200, 2100, 8700],
+        }
+    )
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+        sample.to_excel(writer, index=False)
+    st.download_button("Tải xuống mẫu.xlsx", data=buf.getvalue(), file_name="mau_bctc.xlsx")
+
+# ------------------------
+# UI — File upload
+# ------------------------
 uploaded_file = st.file_uploader(
-    "1. Tải file Excel Báo cáo Tài chính (Chỉ tiêu | Năm trước | Năm sau)",
-    type=['xlsx', 'xls']
+    "1) Tải file Báo cáo Tài chính (Excel hoặc CSV) — cột: Chỉ tiêu | các cột kỳ (VD: 2023, 2024)",
+    type=["xlsx", "xls", "csv"],
 )
 
-if uploaded_file is not None:
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    try:
-        status_text.text("Đang đọc file...")
-        progress_bar.progress(20)
+if uploaded_file is None:
+    st.info("Vui lòng tải lên file để bắt đầu phân tích.")
+    st.stop()
+
+# Read file safely
+try:
+    if uploaded_file.name.lower().endswith(".csv"):
+        df_raw = pd.read_csv(uploaded_file)
+    else:
         df_raw = pd.read_excel(uploaded_file)
-        
-        # Tiền xử lý
-        df_raw.columns = ['Chỉ tiêu', 'Năm trước', 'Năm sau']
-        progress_bar.progress(50)
-        
-        status_text.text("Đang xử lý dữ liệu...")
-        df_processed = process_financial_data(df_raw.copy())
-        st.session_state.df_processed = df_processed
-        progress_bar.progress(80)
-        
-        # --- Chức năng 4: Tính Chỉ số Tài chính (tính trước để dùng cho data_for_ai) ---
-        thanh_toan_hien_hanh_N = "N/A"
-        thanh_toan_hien_hanh_N_1 = "N/A"
-        try:
-            # Lấy Tài sản ngắn hạn
-            tsnh_row = df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]
-            if not tsnh_row.empty:
-                tsnh_n = tsnh_row['Năm sau'].iloc[0]
-                tsnh_n_1 = tsnh_row['Năm trước'].iloc[0]
+except Exception as e:
+    st.error(f"Không thể đọc file: {e}")
+    st.stop()
 
-                # Lấy Nợ ngắn hạn (fallback: nếu không có, dùng tổng nợ phải trả nếu có, hoặc cảnh báo)
-                no_ngan_han_row = df_processed[df_processed['Chỉ tiêu'].str.contains('NỢ NGẮN HẠN', case=False, na=False)]
-                if no_ngan_han_row.empty:
-                    # Fallback: Tìm 'TỔNG NỢ PHẢI TRẢ' nếu có
-                    no_phai_tra_row = df_processed[df_processed['Chỉ tiêu'].str.contains('TỔNG NỢ PHẢI TRẢ', case=False, na=False)]
-                    if not no_phai_tra_row.empty:
-                        no_ngan_han_N = no_phai_tra_row['Năm sau'].iloc[0]
-                        no_ngan_han_N_1 = no_phai_tra_row['Năm trước'].iloc[0]
-                        st.warning("Sử dụng 'TỔNG NỢ PHẢI TRẢ' làm fallback cho 'NỢ NGẮN HẠN'.")
-                    else:
-                        raise IndexError("Không tìm thấy 'NỢ NGẮN HẠN' hoặc 'TỔNG NỢ PHẢI TRẢ'.")
-                else:
-                    no_ngan_han_N = no_ngan_han_row['Năm sau'].iloc[0]
-                    no_ngan_han_N_1 = no_ngan_han_row['Năm trước'].iloc[0]
+# Try to standardize columns
+if "Chỉ tiêu" not in df_raw.columns:
+    if len(df_raw.columns) >= 1:
+        df_raw = df_raw.rename(columns={df_raw.columns[0]: "Chỉ tiêu"})
+    else:
+        st.error("Thiếu cột 'Chỉ tiêu'.")
+        st.stop()
 
-                # Xử lý chia 0
-                divisor_N_1 = no_ngan_han_N_1 if no_ngan_han_N_1 != 0 else 1e-9
-                divisor_N = no_ngan_han_N if no_ngan_han_N != 0 else 1e-9
+# Choose two periods to compare (support multi-period files)
+period_cols = [c for c in df_raw.columns if c != "Chỉ tiêu"]
+if len(period_cols) < 2:
+    st.error("Cần ít nhất 2 cột kỳ để so sánh (VD: 2023, 2024 hoặc Năm trước, Năm sau).")
+    st.stop()
 
-                thanh_toan_hien_hanh_N = tsnh_n / divisor_N
-                thanh_toan_hien_hanh_N_1 = tsnh_n_1 / divisor_N_1
-                
-                st.session_state.thanh_toan_hien_hanh_N_1 = f"{thanh_toan_hien_hanh_N_1:.2f}"
-                st.session_state.thanh_toan_hien_hanh_N = f"{thanh_toan_hien_hanh_N:.2f}"
-            else:
-                raise IndexError("Không tìm thấy 'TÀI SẢN NGẮN HẠN'.")
-        except IndexError:
-            st.warning("Thiếu chỉ tiêu cần thiết để tính chỉ số thanh toán. Vui lòng kiểm tra file Excel.")
-        
-        # Chuẩn bị data_for_ai cho phân tích ban đầu và chat
-        tsnh_row = df_processed[df_processed['Chỉ tiêu'].str.contains('TÀI SẢN NGẮN HẠN', case=False, na=False)]
-        tang_truong_tsnh = tsnh_row['Tốc độ tăng trưởng (%)'].iloc[0] if not tsnh_row.empty else "N/A"
-        
-        st.session_state.data_for_ai = pd.DataFrame({
-            'Chỉ tiêu': [
-                'Toàn bộ Bảng phân tích (dữ liệu thô)', 
-                'Tăng trưởng Tài sản ngắn hạn (%)', 
-                'Thanh toán hiện hành (N-1)', 
-                'Thanh toán hiện hành (N)'
-            ],
-            'Giá trị': [
-                df_processed.to_markdown(index=False),
-                f"{tang_truong_tsnh:.2f}%", 
-                st.session_state.thanh_toan_hien_hanh_N_1, 
-                st.session_state.thanh_toan_hien_hanh_N
+col_left, col_right = st.columns(2)
+with col_left:
+    col_prev = st.selectbox("Chọn kỳ trước", period_cols, index=0)
+with col_right:
+    # Default to last column as current period
+    default_idx = len(period_cols) - 1
+    col_curr = st.selectbox("Chọn kỳ sau", period_cols, index=default_idx)
+
+# Process
+try:
+    df_processed = process_financial_data(df_raw, col_prev, col_curr)
+except ValueError as ve:
+    st.error(f"Lỗi cấu trúc dữ liệu: {ve}")
+    st.stop()
+except Exception as e:
+    st.error(f"Có lỗi khi xử lý dữ liệu: {e}")
+    st.stop()
+
+# ------------------------
+# Results table
+# ------------------------
+st.subheader("2) Tốc độ tăng trưởng & 3) Tỷ trọng cơ cấu tài sản")
+st.dataframe(
+    df_processed.style.format(
+        {
+            col_prev: "{:,.0f}",
+            col_curr: "{:,.0f}",
+            "Tốc độ tăng trưởng (%)": "{:.2f}%",
+            f"Tỷ trọng {col_prev} (%)": "{:.2f}%",
+            f"Tỷ trọng {col_curr} (%)": "{:.2f}%",
+        }
+    ),
+    use_container_width=True,
+)
+
+# ------------------------
+# Charts
+# ------------------------
+with st.expander("📈 Biểu đồ trực quan"):
+    # Growth bar chart
+    growth_chart = alt.Chart(
+        df_processed[["Chỉ tiêu", "Tốc độ tăng trưởng (%)"]]
+    ).mark_bar().encode(
+        x=alt.X("Tốc độ tăng trưởng (%)", title="%"),
+        y=alt.Y("Chỉ tiêu", sort='-x'),
+        tooltip=["Chỉ tiêu", alt.Tooltip("Tốc độ tăng trưởng (%)", format=".2f")],
+    ).properties(height=400)
+
+    st.altair_chart(growth_chart, use_container_width=True)
+
+    # Structure bar (prev vs curr)
+    melted = pd.melt(
+        df_processed[
+            [
+                "Chỉ tiêu",
+                f"Tỷ trọng {col_prev} (%)",
+                f"Tỷ trọng {col_curr} (%)",
             ]
-        }).to_markdown(index=False)
-        
-        progress_bar.progress(100)
-        status_text.text("Xử lý hoàn tất!")
-        st.success("File đã được tải và xử lý thành công.")
+        ],
+        id_vars=["Chỉ tiêu"],
+        var_name="Kỳ",
+        value_name="Tỷ trọng (%)",
+    )
 
-        # --- Chức năng 2 & 3: Hiển thị Kết quả ---
-        st.subheader("2. Tốc độ Tăng trưởng & 3. Tỷ trọng Cơ cấu Tài sản")
-        st.dataframe(df_processed.style.format({
-            'Năm trước': '{:,.0f}',
-            'Năm sau': '{:,.0f}',
-            'Tốc độ tăng trưởng (%)': '{:.2f}%',
-            'Tỷ trọng Năm trước (%)': '{:.2f}%',
-            'Tỷ trọng Năm sau (%)': '{:.2f}%'
-        }), use_container_width=True)
-        
-        # Nút Export
-        col_export1, col_export2 = st.columns(2)
-        with col_export1:
-            if st.button("📥 Tải kết quả Excel"):
-                output = io.BytesIO()
-                df_processed.to_excel(output, index=False)
-                output.seek(0)
-                st.download_button(
-                    label="Tải file",
-                    data=output.getvalue(),
-                    file_name="ket_qua_phan_tich.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-        
-        # --- Chức năng 4: Tính Chỉ số Tài chính (hiển thị) ---
-        st.subheader("4. Các Chỉ số Tài chính Cơ bản")
-        
-        if st.session_state.thanh_toan_hien_hanh_N != "N/A":
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric(
-                    label="Chỉ số Thanh toán Hiện hành (Năm trước)",
-                    value=f"{float(st.session_state.thanh_toan_hien_hanh_N_1):.2f} lần"
-                )
-            with col2:
-                st.metric(
-                    label="Chỉ số Thanh toán Hiện hành (Năm sau)",
-                    value=f"{float(st.session_state.thanh_toan_hien_hanh_N):.2f} lần",
-                    delta=f"{float(st.session_state.thanh_toan_hien_hanh_N) - float(st.session_state.thanh_toan_hien_hanh_N_1):.2f}"
-                )
+    structure_chart = alt.Chart(melted).mark_bar().encode(
+        y=alt.Y("Chỉ tiêu", sort='-x'),
+        x=alt.X("Tỷ trọng (%)", title="%"),
+        color=alt.Color("Kỳ"),
+        tooltip=["Chỉ tiêu", "Kỳ", alt.Tooltip("Tỷ trọng (%)", format=".2f")],
+    ).properties(height=500)
+
+    st.altair_chart(structure_chart, use_container_width=True)
+
+# ------------------------
+# 4) Basic ratios (Current Ratio)
+# ------------------------
+st.subheader("4) Các chỉ số tài chính cơ bản")
+
+df_norm = df_raw.copy()
+df_norm["_KEY"] = df_norm["Chỉ tiêu"].map(normalize_vn)
+
+try:
+    ca_curr = float(df_norm.loc[df_norm["_KEY"] == RE_CA, col_curr].iloc[0])
+    ca_prev = float(df_norm.loc[df_norm["_KEY"] == RE_CA, col_prev].iloc[0])
+    cl_curr = float(df_norm.loc[df_norm["_KEY"] == RE_CL, col_curr].iloc[0])
+    cl_prev = float(df_norm.loc[df_norm["_KEY"] == RE_CL, col_prev].iloc[0])
+
+    curr_ratio_prev = np.nan if cl_prev == 0 else ca_prev / cl_prev
+    curr_ratio_curr = np.nan if cl_curr == 0 else ca_curr / cl_curr
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            f"Chỉ số Thanh toán hiện hành ({col_prev})",
+            f"{curr_ratio_prev:.2f} lần" if np.isfinite(curr_ratio_prev) else "N/A",
+        )
+    with col2:
+        delta = (
+            curr_ratio_curr - curr_ratio_prev
+            if (np.isfinite(curr_ratio_curr) and np.isfinite(curr_ratio_prev))
+            else np.nan
+        )
+        st.metric(
+            f"Chỉ số Thanh toán hiện hành ({col_curr})",
+            f"{curr_ratio_curr:.2f} lần" if np.isfinite(curr_ratio_curr) else "N/A",
+            None if not np.isfinite(delta) else f"{delta:.2f}",
+        )
+except Exception:
+    st.warning("Thiếu chỉ tiêu 'TÀI SẢN NGẮN HẠN' hoặc 'NỢ NGẮN HẠN' để tính chỉ số.")
+    curr_ratio_prev = np.nan
+    curr_ratio_curr = np.nan
+
+# ------------------------
+# 5) AI commentary (one-shot)
+# ------------------------
+st.subheader("5) Nhận xét tình hình tài chính (AI)")
+
+md_table = df_processed.to_markdown(index=False)
+summary_df = pd.DataFrame(
+    {
+        "Chỉ tiêu": [
+            "Bảng phân tích (dữ liệu)",
+            f"Tăng trưởng Tài sản ngắn hạn (%) {col_prev}->{col_curr}",
+            f"Thanh toán hiện hành ({col_prev})",
+            f"Thanh toán hiện hành ({col_curr})",
+        ],
+        "Giá trị": [
+            md_table,
+            (
+                f"{df_processed.loc[df_norm['_KEY'] == RE_CA, 'Tốc độ tăng trưởng (%)'].iloc[0]:.2f}%"
+                if any(df_norm["_KEY"] == RE_CA)
+                else "N/A"
+            ),
+            "N/A" if not np.isfinite(curr_ratio_prev) else f"{curr_ratio_prev:.2f}",
+            "N/A" if not np.isfinite(curr_ratio_curr) else f"{curr_ratio_curr:.2f}",
+        ],
+    }
+)
+
+st.dataframe(summary_df, use_container_width=True)
+
+col_a, col_b = st.columns(2)
+with col_a:
+    if st.button("Yêu cầu AI phân tích"):
+        if not api_key:
+            st.error("Vui lòng nhập hoặc cấu hình 'GEMINI_API_KEY' trong Sidebar.")
         else:
-            st.warning("Không thể tính chỉ số thanh toán do thiếu dữ liệu.")
-        
-        # --- Chức năng 5: Nhận xét AI Ban đầu ---
-        st.subheader("5. Nhận xét Tình hình Tài chính (AI)")
-        
-        if st.button("Yêu cầu AI Phân tích Ban đầu"):
-            api_key = st.secrets.get("GEMINI_API_KEY") 
-            
-            if api_key:
-                with st.spinner('Đang gửi dữ liệu và chờ Gemini phân tích...'):
-                    ai_result = get_ai_analysis(st.session_state.data_for_ai, api_key)
-                    st.markdown("**Kết quả Phân tích từ Gemini AI:**")
-                    st.info(ai_result)
-            else:
-                st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets.")
+            with st.spinner("Đang gửi dữ liệu đến Gemini…"):
+                ai_text = get_ai_analysis(summary_df.to_markdown(index=False), api_key)
+            st.markdown("**Kết quả Phân tích từ Gemini AI:**")
+            st.info(ai_text)
 
-        # --- Chức năng 6: Khung Chat với Gemini ---
-        st.subheader("6. Chat với AI: Hỏi thêm về Dữ liệu Tài chính")
-        st.info("💡 Bạn có thể hỏi thêm: 'Phân tích rủi ro nợ?', 'So sánh với năm trước?', hoặc bất kỳ câu hỏi nào liên quan đến dữ liệu.")
-        
-        # Hiển thị lịch sử chat
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
-        
-        # Chat input
-        if prompt := st.chat_input("Nhập câu hỏi của bạn..."):
-            # Thêm user message
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-            
-            # Gọi AI
-            api_key = st.secrets.get("GEMINI_API_KEY")
-            if api_key:
-                with st.chat_message("assistant"):
-                    with st.spinner("Đang suy nghĩ..."):
-                        response = get_ai_chat_response(st.session_state.messages, api_key, st.session_state.data_for_ai)
-                        st.markdown(response)
-                        st.session_state.messages.append({"role": "assistant", "content": response})
-            else:
-                st.error("Lỗi: Không tìm thấy Khóa API cho chat.")
+with col_b:
+    # Export processed table & summary
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="xlsxwriter") as writer:
+        df_processed.to_excel(writer, index=False, sheet_name="Phan_tich")
+        summary_df.to_excel(writer, index=False, sheet_name="Tom_tat")
+    st.download_button(
+        "⬇️ Tải Excel kết quả",
+        data=excel_buf.getvalue(),
+        file_name=f"phan_tich_bctc_{now}.xlsx",
+    )
 
-    except ValueError as ve:
-        st.error(f"Lỗi cấu trúc dữ liệu: {ve}")
-    except Exception as e:
-        st.error(f"Có lỗi xảy ra khi đọc hoặc xử lý file: {e}. Vui lòng kiểm tra định dạng file.")
+# ------------------------
+# 6) Khung chat với Gemini
+# ------------------------
+st.subheader("6) Khung chat với Gemini 🤖")
+if "chat" not in st.session_state:
+    st.session_state.chat = []  # list of {user: str, ai: str}
 
-else:
-    st.info("Vui lòng tải lên file Excel để bắt đầu phân tích.")
+prompt_help = (
+    "Hãy hỏi: 'Phân tích rủi ro thanh khoản', 'Đề xuất KPI theo dõi', 'Viết summary cho ban giám đốc',..."
+)
+user_msg = st.text_input("Tin nhắn", placeholder=prompt_help)
+
+# Context card
+with st.expander("📎 Ngữ cảnh gửi kèm cho AI"):
+    st.markdown("Bảng dữ liệu đã xử lý sẽ được AI tham chiếu.")
+    st.dataframe(df_processed, use_container_width=True)
+
+send = st.button("Gửi & nhận trả lời")
+if send and user_msg:
+    if not api_key:
+        st.error("Vui lòng nhập Gemini API Key ở Sidebar.")
+    else:
+        # We keep a compact history (last 5 turns)
+        history = st.session_state.chat[-5:]
+        # Attach a lightweight context prefix of the table
+        context_text = (
+            "Bối cảnh dữ liệu (rút gọn):\n" + df_processed.head(20).to_markdown(index=False)
+        )
+        full_user = f"{context_text}\n\nYêu cầu: {user_msg}"
+        ai_reply = gemini_chat(full_user, history, api_key)
+        st.session_state.chat.append({"user": user_msg, "ai": ai_reply})
+
+# Render chat history
+for turn in st.session_state.chat[-20:]:
+    with st.chat_message("user"):
+        st.write(turn["user"])
+    with st.chat_message("assistant"):
+        st.write(turn["ai"])
+
+# ------------------------
+# Tips & notes
+# ------------------------
+with st.expander("💡 Gợi ý sử dụng & lưu ý"):
+    st.markdown(
+        """
+        - Đảm bảo tồn tại chỉ tiêu **TỔNG CỘNG TÀI SẢN** để tính tỷ trọng.
+        - Có thể đặt tên kỳ tuỳ ý (VD: *Năm trước/Năm sau* hoặc *2023/2024*), sau đó chọn 2 kỳ ở phần *Tuỳ chọn kỳ*.
+        - Hệ thống chuẩn hoá dấu tiếng Việt để khớp các chỉ tiêu như **TÀI SẢN NGẮN HẠN**, **NỢ NGẮN HẠN**.
+        - Chia cho 0 trả về **N/A** thay vì gây lỗi.
+        - Nút **Tải Excel kết quả** giúp bạn lưu lại bảng phân tích & tóm tắt.
+        - Khung **chat với Gemini** giữ 5 lượt hội thoại gần nhất làm ngữ cảnh; bạn có thể yêu cầu báo cáo, bullet list khuyến nghị, hoặc tạo memo gửi lãnh đạo.
+        """
+    )
