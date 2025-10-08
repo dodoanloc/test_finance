@@ -44,11 +44,11 @@ def extract_project_data(full_text, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name='gemini-2.5-flash',  # Updated to available model in 2025
+            model_name='gemini-2.5-flash',
             generation_config=genai.types.GenerationConfig(
-                temperature=0.1,  # Thấp để extract chính xác
+                temperature=0.1,
                 top_p=0.8,
-                max_output_tokens=500,
+                max_output_tokens=2048,  # Tăng để tránh MAX_TOKENS
             ),
             safety_settings={
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
@@ -59,7 +59,7 @@ def extract_project_data(full_text, api_key):
         )
 
         prompt = f"""
-        Bạn là chuyên gia phân tích dự án kinh doanh. Từ văn bản mô tả phương án kinh doanh sau, hãy extract các thông tin sau dưới dạng JSON hợp lệ:
+        Bạn là chuyên gia phân tích dự án kinh doanh. Từ văn bản mô tả phương án kinh doanh sau, hãy extract các thông tin sau dưới dạng JSON hợp lệ, ngắn gọn nhất có thể:
         - "von_dau_tu": Vốn đầu tư ban đầu (số, đơn vị VND hoặc USD, nếu không có giả sử 0).
         - "dong_doi_du_an": Dòng đời dự án (số năm, nếu không có giả sử 5).
         - "doanh_thu": Danh sách doanh thu theo năm [năm1, năm2, ..., nămN] (danh sách số, nếu constant thì lặp lại).
@@ -68,19 +68,42 @@ def extract_project_data(full_text, api_key):
         - "thue": Tỷ lệ thuế (%, dạng số thập phân như 0.20 cho 20%).
 
         Nếu thông tin không đầy đủ, sử dụng giá trị mặc định hợp lý (ví dụ: doanh thu/chi phí tăng 5%/năm nếu chỉ có năm đầu).
-        Đảm bảo danh sách doanh thu và chi phí có độ dài bằng dong_doi_du_an.
+        Đảm bảo danh sách doanh thu và chi phí có độ dài bằng dong_doi_du_an. Giữ JSON ngắn gọn.
 
         Văn bản:
-        {full_text[:4000]}  # Giới hạn để tránh token limit
+        {full_text[:3000]}  # Giảm để tránh token input cao
         """
 
         response = model.generate_content(prompt)
-        # Giả sử response.text là JSON string, parse nó
+        
+        # Xử lý response an toàn
+        if not response.candidates or len(response.candidates) == 0:
+            return {"error": "Không có candidates trong response."}
+        
+        candidate = response.candidates[0]
+        
+        # Kiểm tra safety
+        if candidate.safety_ratings:
+            for rating in candidate.safety_ratings:
+                if rating.probability.name == "BLOCKED":
+                    return {"error": f"Response bị block bởi safety: {rating.category.name}"}
+        
+        # Kiểm tra finish_reason
+        if candidate.finish_reason.name != "STOP":
+            return {"error": f"Generation không hoàn tất. Finish reason: {candidate.finish_reason.name}"}
+        
+        # Lấy text từ parts
+        if candidate.content and candidate.content.parts:
+            text = candidate.content.parts[0].text
+        else:
+            return {"error": "Không có content parts trong response."}
+        
+        # Parse JSON
         try:
-            data = json.loads(response.text.strip())
+            data = json.loads(text.strip())
             return data
-        except json.JSONDecodeError:
-            return {"error": "Không thể parse JSON từ AI response."}
+        except json.JSONDecodeError as e:
+            return {"error": f"Không thể parse JSON từ AI response: {e}. Raw text: {text[:200]}"}
 
     except GoogleAPIError as e:
         return {"error": f"Lỗi gọi Gemini API: {e}"}
@@ -101,24 +124,37 @@ def build_cash_flow(extracted_data):
     tax_rate = extracted_data.get("thue", 0.2)
     wacc = extracted_data.get("wacc", 0.1)
 
-    # Đảm bảo lists có đúng length
-    if len(revenues) != years:
-        revenues = [revenues[0]] * years if revenues else [1000000000] * years  # Default
-    if len(costs) != years:
-        costs = [costs[0]] * years if costs else [800000000] * years  # Default
+    # Đảm bảo lists có đúng length và là số
+    if isinstance(revenues, list) and len(revenues) != years:
+        if revenues:
+            rev0 = float(revenues[0]) if revenues[0] else 1000000000
+            revenues = [rev0 * (1.05 ** i) for i in range(years)]  # Giả sử tăng 5%
+        else:
+            revenues = [1000000000] * years
+    elif not isinstance(revenues, list):
+        revenues = [float(revenues)] * years if revenues else [1000000000] * years
 
-    cash_flows = [-investment]
+    if isinstance(costs, list) and len(costs) != years:
+        if costs:
+            cost0 = float(costs[0]) if costs[0] else 800000000
+            costs = [cost0 * (1.03 ** i) for i in range(years)]  # Giả sử tăng 3%
+        else:
+            costs = [800000000] * years
+    elif not isinstance(costs, list):
+        costs = [float(costs)] * years if costs else [800000000] * years
+
+    cash_flows = [-float(investment)]
     for i in range(years):
         ebit = revenues[i] - costs[i]
         tax = ebit * tax_rate if ebit > 0 else 0
-        net_cf = ebit - tax  # Giản lược, giả sử no depreciation etc.
+        net_cf = ebit - tax
         cash_flows.append(net_cf)
 
     df = pd.DataFrame({
         'Năm': list(range(0, years + 1)),
         'Dòng tiền (VND)': cash_flows
     })
-    return df, wacc
+    return df, float(wacc)
 
 # --- Hàm tính IRR không dùng scipy ---
 def calculate_irr(cash_flows, tol=1e-6, max_iter=100):
@@ -127,7 +163,7 @@ def calculate_irr(cash_flows, tol=1e-6, max_iter=100):
         return np.nan
     
     low = -0.99
-    high = 1.0
+    high = 10.0  # Tăng high để handle IRR cao
     
     for _ in range(max_iter):
         mid = (low + high) / 2
@@ -154,25 +190,43 @@ def calculate_metrics(cash_flows, wacc):
     # IRR
     irr = calculate_irr(cash_flows)
 
-    # PP (Payback Period)
+    # PP (Payback Period) - interpolate for precision
     cumulative_cf = np.cumsum(cash_flows)
-    pp = np.argmax(cumulative_cf >= 0)
-    if cumulative_cf[pp] < 0:
-        pp = len(cash_flows)  # Not recovered
+    if cumulative_cf[-1] < 0:
+        pp = np.inf
+    else:
+        pp_idx = np.argmax(cumulative_cf >= 0)
+        if pp_idx == 0:
+            pp = 0
+        elif pp_idx == len(cash_flows):
+            pp = len(cash_flows) - 1
+        else:
+            prev_cum = cumulative_cf[pp_idx - 1]
+            period_cf = cash_flows[pp_idx]
+            pp = (pp_idx - 1) + (-prev_cum / period_cf)
 
     # DPP (Discounted Payback)
     discounted_cf = [cf / (1 + wacc)**t for t, cf in enumerate(cash_flows)]
     cumulative_disc = np.cumsum(discounted_cf)
-    dpp = np.argmax(cumulative_disc >= 0)
-    if cumulative_disc[dpp] < 0:
-        dpp = len(cash_flows)
+    if cumulative_disc[-1] < 0:
+        dpp = np.inf
+    else:
+        dpp_idx = np.argmax(cumulative_disc >= 0)
+        if dpp_idx == 0:
+            dpp = 0
+        elif dpp_idx == len(discounted_cf):
+            dpp = len(discounted_cf) - 1
+        else:
+            prev_cum_disc = cumulative_disc[dpp_idx - 1]
+            period_disc_cf = discounted_cf[dpp_idx]
+            dpp = (dpp_idx - 1) + (-prev_cum_disc / period_disc_cf)
 
     return {
         'NPV': npv,
-        'IRR': irr * 100 if not np.isnan(irr) else np.nan,  # %
-        'PP': pp,
-        'DPP': dpp,
-        'WACC': wacc * 100  # %
+        'IRR': irr * 100 if not np.isnan(irr) else np.nan,
+        'PP': round(pp, 2) if not np.isinf(pp) else "Chưa hoàn vốn",
+        'DPP': round(dpp, 2) if not np.isinf(dpp) else "Chưa hoàn vốn",
+        'WACC': wacc * 100
     }
 
 # --- Hàm gọi AI phân tích chỉ số ---
@@ -181,11 +235,11 @@ def get_ai_metrics_analysis(metrics, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name='gemini-2.5-flash',  # Updated to available model in 2025
+            model_name='gemini-2.5-flash',
             generation_config=genai.types.GenerationConfig(
                 temperature=0.7,
                 top_p=0.8,
-                max_output_tokens=800,
+                max_output_tokens=1024,  # Tăng một chút
             ),
             safety_settings={
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
@@ -196,7 +250,7 @@ def get_ai_metrics_analysis(metrics, api_key):
         )
 
         prompt = f"""
-        Bạn là chuyên gia đánh giá dự án kinh doanh. Dựa trên các chỉ số sau, hãy phân tích hiệu quả dự án một cách khách quan (3-4 đoạn):
+        Bạn là chuyên gia đánh giá dự án kinh doanh. Dựa trên các chỉ số sau, hãy phân tích hiệu quả dự án một cách khách quan (3-4 đoạn ngắn gọn):
         - NPV > 0: Hấp dẫn.
         - IRR > WACC: Tốt.
         - PP < 3 năm: Nhanh.
@@ -211,7 +265,27 @@ def get_ai_metrics_analysis(metrics, api_key):
         """
 
         response = model.generate_content(prompt)
-        return response.text
+        
+        # Xử lý response an toàn tương tự
+        if not response.candidates or len(response.candidates) == 0:
+            return "Không có candidates trong response."
+        
+        candidate = response.candidates[0]
+        
+        if candidate.safety_ratings:
+            for rating in candidate.safety_ratings:
+                if rating.probability.name == "BLOCKED":
+                    return f"Response bị block bởi safety: {rating.category.name}"
+        
+        if candidate.finish_reason.name != "STOP":
+            return f"Generation không hoàn tất. Finish reason: {candidate.finish_reason.name}"
+        
+        if candidate.content and candidate.content.parts:
+            text = candidate.content.parts[0].text
+        else:
+            return "Không có content parts trong response."
+        
+        return text
 
     except GoogleAPIError as e:
         return f"Lỗi gọi Gemini API: {e}"
@@ -242,7 +316,7 @@ if uploaded_file is not None:
                     st.json(extracted)
 
 # --- Chức năng 2: Xây dựng Bảng Dòng Tiền ---
-if st.session_state.extracted_data:
+if st.session_state.extracted_data and "error" not in st.session_state.extracted_data:
     st.header("2. Bảng Dòng Tiền Dự Án")
     if st.button("📊 Xây dựng Bảng Dòng Tiền"):
         cash_flow_df, wacc = build_cash_flow(st.session_state.extracted_data)
@@ -263,10 +337,11 @@ if st.session_state.cash_flow_df is not None:
     col1, col2 = st.columns(2)
     with col1:
         st.metric("NPV", f"{metrics['NPV']:,.0f} VND")
-        st.metric("IRR", f"{metrics['IRR']:.2f}%" if not np.isnan(metrics['IRR']) else "N/A")
+        irr_val = f"{metrics['IRR']:.2f}%" if not np.isnan(metrics['IRR']) else "N/A"
+        st.metric("IRR", irr_val)
     with col2:
-        st.metric("PP", f"{metrics['PP']} năm")
-        st.metric("DPP", f"{metrics['DPP']} năm")
+        st.metric("PP", f"{metrics['PP']}" if isinstance(metrics['PP'], str) else f"{metrics['PP']} năm")
+        st.metric("DPP", f"{metrics['DPP']}" if isinstance(metrics['DPP'], str) else f"{metrics['DPP']} năm")
 
 # --- Chức năng 4: Phân Tích AI ---
 if st.session_state.metrics:
@@ -278,7 +353,10 @@ if st.session_state.metrics:
                 analysis = get_ai_metrics_analysis(st.session_state.metrics, api_key)
                 st.session_state.ai_analysis = analysis
                 st.markdown("**Phân tích từ AI:**")
-                st.info(analysis)
+                if "error" in analysis.lower() or "lỗi" in analysis.lower():
+                    st.error(analysis)
+                else:
+                    st.info(analysis)
         else:
             st.error("Lỗi: Cấu hình GEMINI_API_KEY.")
 
@@ -298,7 +376,9 @@ if st.session_state.cash_flow_df is not None:
             )
     with col_export2:
         if st.button("📥 Tải Metrics Excel"):
-            metrics_df = pd.DataFrame(list(st.session_state.metrics.items()), columns=['Chỉ số', 'Giá trị'])
+            # Format metrics for export
+            export_metrics = {k: v if not isinstance(v, str) else v for k, v in st.session_state.metrics.items()}
+            metrics_df = pd.DataFrame(list(export_metrics.items()), columns=['Chỉ số', 'Giá trị'])
             output = io.BytesIO()
             metrics_df.to_excel(output, index=False)
             output.seek(0)
