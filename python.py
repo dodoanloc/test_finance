@@ -3,12 +3,12 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from scipy.optimize import newton
 import google.generativeai as genai
 from google.api_core.exceptions import GoogleAPIError
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from docx import Document
 import io
+import json
 
 # --- Cấu hình Trang Streamlit ---
 st.set_page_config(
@@ -44,7 +44,7 @@ def extract_project_data(full_text, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name='gemini-2.5-flash',  # Updated to available model in 2025
             generation_config=genai.types.GenerationConfig(
                 temperature=0.1,  # Thấp để extract chính xác
                 top_p=0.8,
@@ -76,7 +76,6 @@ def extract_project_data(full_text, api_key):
 
         response = model.generate_content(prompt)
         # Giả sử response.text là JSON string, parse nó
-        import json
         try:
             data = json.loads(response.text.strip())
             return data
@@ -93,7 +92,7 @@ def extract_project_data(full_text, api_key):
 def build_cash_flow(extracted_data):
     """Xây dựng bảng dòng tiền từ dữ liệu extract."""
     if "error" in extracted_data:
-        return None
+        return None, None
 
     investment = extracted_data.get("von_dau_tu", 0)
     years = extracted_data.get("dong_doi_du_an", 5)
@@ -121,6 +120,27 @@ def build_cash_flow(extracted_data):
     })
     return df, wacc
 
+# --- Hàm tính IRR không dùng scipy ---
+def calculate_irr(cash_flows, tol=1e-6, max_iter=100):
+    """Tính IRR bằng phương pháp bisection."""
+    if len(cash_flows) < 2:
+        return np.nan
+    
+    low = -0.99
+    high = 1.0
+    
+    for _ in range(max_iter):
+        mid = (low + high) / 2
+        npv_mid = np.npv(mid, cash_flows)
+        if abs(npv_mid) < tol:
+            return mid
+        if npv_mid > 0:
+            low = mid
+        else:
+            high = mid
+    
+    return mid  # approximate
+
 # --- Hàm tính toán chỉ số hiệu quả ---
 @st.cache_data
 def calculate_metrics(cash_flows, wacc):
@@ -132,12 +152,7 @@ def calculate_metrics(cash_flows, wacc):
     npv = np.npv(wacc, cash_flows)
 
     # IRR
-    def irr_func(rate):
-        return np.npv(rate, cash_flows)
-    try:
-        irr = newton(irr_func, 0.1)  # Initial guess 10%
-    except:
-        irr = np.nan
+    irr = calculate_irr(cash_flows)
 
     # PP (Payback Period)
     cumulative_cf = np.cumsum(cash_flows)
@@ -166,7 +181,7 @@ def get_ai_metrics_analysis(metrics, api_key):
     try:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(
-            model_name='gemini-1.5-flash',
+            model_name='gemini-2.5-flash',  # Updated to available model in 2025
             generation_config=genai.types.GenerationConfig(
                 temperature=0.7,
                 top_p=0.8,
@@ -248,7 +263,7 @@ if st.session_state.cash_flow_df is not None:
     col1, col2 = st.columns(2)
     with col1:
         st.metric("NPV", f"{metrics['NPV']:,.0f} VND")
-        st.metric("IRR", f"{metrics['IRR']:.2f}%")
+        st.metric("IRR", f"{metrics['IRR']:.2f}%" if not np.isnan(metrics['IRR']) else "N/A")
     with col2:
         st.metric("PP", f"{metrics['PP']} năm")
         st.metric("DPP", f"{metrics['DPP']} năm")
