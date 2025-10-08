@@ -16,4 +16,11 @@ openpyxl
 tabulate
 
 google-generativeai
+streamlit
+pandas
+numpy
+google-generativeai
+python-docx
+scipy
+
 
