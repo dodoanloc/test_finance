@@ -1,4 +1,3 @@
-# app.py — Minimal & Debug
 import os
 import uuid
 import json
@@ -6,20 +5,65 @@ import requests
 import streamlit as st
 from datetime import datetime
 
-st.set_page_config(page_title="Debug Chat → n8n", page_icon="🛰️", layout="centered")
+# ========== CẤU HÌNH CƠ BẢN ==========
+st.set_page_config(
+    page_title="Chuyên gia tư vấn pháp luật về tiền gửi",
+    page_icon="💬",
+    layout="centered",
+)
 
-# ==== CONFIG ====
-N8N_URL = st.secrets.get("N8N_CHAT_WEBHOOK_URL", os.getenv("N8N_CHAT_WEBHOOK_URL", ""))  # PRODUCTION
-N8N_TEST = st.secrets.get("N8N_CHAT_WEBHOOK_TEST_URL", os.getenv("N8N_CHAT_WEBHOOK_TEST_URL", ""))  # optional
-AUTH_HEADER = st.secrets.get("N8N_AUTH_HEADER", os.getenv("N8N_AUTH_HEADER", ""))  # optional
+# ========== ĐỌC THÔNG TIN WEBHOOK ==========
+N8N_URL = st.secrets.get("N8N_CHAT_WEBHOOK_URL", os.getenv("N8N_CHAT_WEBHOOK_URL", ""))
+N8N_TEST = st.secrets.get("N8N_CHAT_WEBHOOK_TEST_URL", os.getenv("N8N_CHAT_WEBHOOK_TEST_URL", ""))
+AUTH_HEADER = st.secrets.get("N8N_AUTH_HEADER", os.getenv("N8N_AUTH_HEADER", ""))
 
-st.title("🔧 Debug gửi chat → n8n webhook")
+# ========== CSS GIAO DIỆN ==========
+st.markdown("""
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;600&display=swap');
+        html, body, [class*="css"] {
+            font-family: 'Montserrat', sans-serif;
+            background-color: #fafafa;
+            color: #333;
+        }
+        .header-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+        .header-title {
+            font-weight: 600;
+            font-size: 24px;
+            color: #8A1538;
+            text-align: center;
+        }
+        .copyright {
+            font-size: 13px;
+            color: #777;
+            text-align: center;
+            margin-top: 30px;
+        }
+        .chat-box {
+            background: white;
+            padding: 16px;
+            border-radius: 12px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.1);
+            margin-bottom: 10px;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
-with st.expander("⚙️ Cấu hình đang dùng"):
-    st.write("N8N_CHAT_WEBHOOK_URL:", N8N_URL or "⛔ Chưa đặt")
-    st.write("N8N_CHAT_WEBHOOK_TEST_URL:", N8N_TEST or "—")
-    st.write("AUTH_HEADER:", ("(đang bật)" if AUTH_HEADER else "—"))
+# ========== HEADER (CÓ LOGO) ==========
+st.markdown("""
+<div class='header-container'>
+    <img src='logo.png' width='45'>
+    <div class='header-title'>CHUYÊN GIA TƯ VẤN PHÁP LUẬT VỀ TIỀN GỬI</div>
+</div>
+""", unsafe_allow_html=True)
 
+# ========== HÀM GỬI YÊU CẦU ==========
 def build_headers():
     h = {"Content-Type": "application/json"}
     if AUTH_HEADER:
@@ -32,35 +76,47 @@ def build_headers():
             h["Authorization"] = f"Bearer {AUTH_HEADER}"
     return h
 
-def post(url, payload):
-    r = requests.post(url, headers=build_headers(), json=payload, timeout=60)
-    ct = r.headers.get("Content-Type", "")
-    try:
-        data = r.json() if "application/json" in ct else {"text": r.text}
-    except Exception:
-        data = {"text": r.text}
-    return r.status_code, data, r.text
+def post_to_n8n(prompt, session_id):
+    if not N8N_URL:
+        st.error("⚠️ Chưa cấu hình N8N_CHAT_WEBHOOK_URL trong secrets.toml hoặc biến môi trường.")
+        return None
 
-# ==== FORM ====
+    payload = {"chatInput": prompt, "sessionId": session_id}
+    try:
+        r = requests.post(N8N_URL, headers=build_headers(), json=payload, timeout=60)
+        if r.status_code != 200:
+            st.error(f"⚠️ Lỗi {r.status_code}: {r.text}")
+            return None
+        try:
+            data = r.json()
+            return data.get("answer") or data.get("output") or data
+        except Exception:
+            return r.text
+    except Exception as e:
+        st.error(f"🚫 Không thể gửi yêu cầu: {e}")
+        return None
+
+# ========== LƯU SESSION ==========
 if "session_id" not in st.session_state:
     st.session_state.session_id = str(uuid.uuid4())
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-prompt = st.text_input("Câu hỏi:", value="ping", placeholder="Nhập câu hỏi để gửi vào n8n…")
-use_test = st.checkbox("Dùng TEST URL (webhook-test)", value=False)
+# ========== FORM CHAT ==========
+with st.container():
+    st.markdown("<div class='chat-box'>", unsafe_allow_html=True)
+    for msg in st.session_state.messages:
+        st.markdown(f"**{msg['role']}:** {msg['content']}")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+prompt = st.text_input("Nhập câu hỏi của bạn:", placeholder="Ví dụ: Lãi suất tiền gửi kỳ hạn 6 tháng hiện nay là bao nhiêu?")
 if st.button("Gửi"):
-    url = (N8N_TEST if use_test and N8N_TEST else N8N_URL).strip()
-    if not url:
-        st.error("Chưa cấu hình URL. Đặt N8N_CHAT_WEBHOOK_URL (và/hoặc N8N_CHAT_WEBHOOK_TEST_URL).")
-    else:
-        payload = {"chatInput": prompt, "sessionId": st.session_state.session_id}
-        st.write("➡️ URL:", url)
-        st.write("➡️ Payload:", payload)
-        try:
-            code, data, raw = post(url, payload)
-            st.write("⬅️ Status:", code)
-            st.write("⬅️ Parsed:", data)
-            st.code(raw[:2000], language="json")
-        except Exception as e:
-            st.error(f"Exception: {e}")
+    if prompt.strip():
+        st.session_state.messages.append({"role": "👤 Bạn", "content": prompt})
+        answer = post_to_n8n(prompt, st.session_state.session_id)
+        if answer:
+            st.session_state.messages.append({"role": "🤖 Trợ lý", "content": str(answer)})
+        st.rerun()
 
-st.caption(f"Session: {st.session_state.session_id} · {datetime.utcnow().isoformat()}Z")
+# ========== COPYRIGHT ==========
+st.markdown("<div class='copyright'>© Đội 4: Tam Nông 2025 - Agribank Thọ Xuân</div>", unsafe_allow_html=True)
