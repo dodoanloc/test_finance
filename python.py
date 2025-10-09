@@ -28,7 +28,7 @@ AUTH_HEADER = st.secrets.get("N8N_AUTH_HEADER", os.getenv("N8N_AUTH_HEADER", "")
 # 3) Tên chatbot
 APP_TITLE = "CHUYÊN GIA TƯ VẤN PHÁP LUẬT VỀ TIỀN GỬI"
 APP_BRAND = "Agribank"
-FOOTER_TEXT = "Đội 4: Tam Nông 2025 — copyright © 2025"
+FOOTER_TEXT = "Đội 4: Tam Nông 2025 — Copyright © 2025"
 
 # 4) Màu sắc thương hiệu Agribank
 AGRI_RED = "#8A1538"
@@ -290,13 +290,11 @@ with st.container():
     with st.form("chat_form", clear_on_submit=True):
         user_text = st.text_input(
             "Nhập câu hỏi pháp luật về tiền gửi…",
-            placeholder="Ví dụ: Quy định lãi suất không kỳ hạn hiện hành? Quyền và nghĩa vụ của người gửi tiền?",
+            placeholder="",
             label_visibility="collapsed",
         )
         submitted = st.form_submit_button("Gửi", use_container_width=True)
     st.markdown(
-        '<div class="disclaimer">* Trợ lý chỉ tư vấn dựa trên dữ liệu đã nạp vào hệ thống. '
-        'Vui lòng kiểm tra văn bản pháp luật hiện hành khi áp dụng thực tế.</div>',
         unsafe_allow_html=True
     )
     st.markdown('</div>', unsafe_allow_html=True)
