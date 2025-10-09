@@ -1,385 +1,330 @@
-# investment_app.py - Phiên bản HOÀN CHỈNH (Sửa lỗi Rerun và Thêm Chỉnh sửa Thủ công)
+# app.py
+# Streamlit chat UI for Agribank legal assistant (Deposits Law)
+# Author: ChatGPT (Đội 4: Tam Nông)
+# Requires: streamlit>=1.36, requests
 
+import os
+import time
+import uuid
+import json
+import requests
 import streamlit as st
-import pandas as pd
-import numpy as np
-import numpy_financial as npf 
-from google import genai
-from google.genai.errors import APIError
-from docx import Document
-import io
-import re
+from datetime import datetime
+from typing import Any, Dict, Optional
 
-# --- Cấu hình Trang Streamlit ---
-st.set_page_config(
-    page_title="App Đánh Giá Phương Án Kinh Doanh",
-    layout="wide"
-)
+# ========================
+# ---- CONFIG SECTION ----
+# ========================
 
-st.title("Ứng dụng Đánh giá Phương án Kinh doanh 📈")
+# 1) Đặt URL webhook n8n (Chat Trigger) qua secrets hoặc env:
+#    - Ưu tiên: .streamlit/secrets.toml -> N8N_CHAT_WEBHOOK_URL = "https://<your-n8n>/webhook/<id>"
+#    - Hoặc: export N8N_CHAT_WEBHOOK_URL="https://<your-n8n>/webhook/<id>"
+N8N_WEBHOOK_URL = st.secrets.get("N8N_CHAT_WEBHOOK_URL", os.getenv("N8N_CHAT_WEBHOOK_URL", ""))
 
-# --- Hàm đọc file Word ---
-def read_docx_file(uploaded_file):
-    """Đọc nội dung văn bản từ file Word."""
-    try:
-        doc = Document(io.BytesIO(uploaded_file.read()))
-        full_text = []
-        for para in doc.paragraphs:
-            full_text.append(para.text)
-        return "\n".join(full_text)
-    except Exception as e:
-        return f"Lỗi đọc file Word: {e}"
+# 2) Tùy chọn Header bảo mật (Bearer token, API-Key...), để trống nếu không dùng.
+#    - Ví dụ: st.secrets["N8N_AUTH_HEADER"] = "Bearer YOUR_TOKEN"
+AUTH_HEADER = st.secrets.get("N8N_AUTH_HEADER", os.getenv("N8N_AUTH_HEADER", ""))
 
-# --- Hàm gọi API Gemini để trích xuất thông tin (Yêu cầu 1) ---
-@st.cache_data
-def extract_financial_data(doc_text, api_key):
-    """Sử dụng Gemini để trích xuất các thông số tài chính từ văn bản."""
-    
-    if not api_key:
-        raise ValueError("Khóa API không được cung cấp.")
-        
-    client = genai.Client(api_key=api_key)
-    model_name = 'gemini-2.5-flash'
-    
-    prompt = f"""
-    Bạn là một chuyên gia tài chính và phân tích dự án. Nhiệm vụ của bạn là trích xuất các thông số sau từ nội dung văn bản kinh doanh bên dưới. 
-    Các thông số này phải là GIÁ TRỊ SỐ, không có đơn vị (ví dụ: 1000000). 
-    
-    Vốn đầu tư (Initial Investment - C0): Giá trị tuyệt đối của vốn ban đầu cần bỏ ra.
-    Dòng đời dự án (Project Life - N): Số năm hoạt động của dự án.
-    WACC (Cost of Capital - k): Tỷ lệ chiết khấu (dạng thập phân, ví dụ: 0.10 cho 10%).
-    Thuế suất (Tax Rate - t): Tỷ lệ thuế thu nhập doanh nghiệp (dạng thập phân, ví dụ: 0.20 cho 20%).
-    
-    Doanh thu hàng năm (Annual Revenue - R): Nếu không có thông tin chi tiết từng năm, hãy ước tính một con số đại diện cho doanh thu hàng năm.
-    Chi phí hoạt động hàng năm (Annual Operating Cost - C): Nếu không có thông tin chi tiết từng năm, hãy ước tính một con số đại diện cho chi phí hoạt động hàng năm (chưa bao gồm Khấu hao).
-    
-    Nếu không tìm thấy thông tin cụ thể, hãy trả về 0 cho giá trị số (trừ WACC và Thuế suất nên là 0.2 nếu không tìm thấy).
+# 3) Tên chatbot
+APP_TITLE = "CHUYÊN GIA TƯ VẤN PHÁP LUẬT VỀ TIỀN GỬI"
+APP_BRAND = "Agribank"
+FOOTER_TEXT = "Đội 4: Tam Nông 2025 — copyright © 2025"
 
-    Định dạng đầu ra **bắt buộc** là JSON nguyên mẫu (RAW JSON), không có bất kỳ giải thích hay văn bản nào khác.
-    
-    {{
-      "Vốn đầu tư": <Giá trị số>,
-      "Dòng đời dự án": <Giá trị số năm>,
-      "Doanh thu hàng năm": <Giá trị số>,
-      "Chi phí hoạt động hàng năm": <Giá trị số>,
-      "WACC": <Giá trị số thập phân>,
-      "Thuế suất": <Giá trị số thập phân>
-    }}
+# 4) Màu sắc thương hiệu Agribank
+AGRI_RED = "#8A1538"
+AGRI_GREEN = "#009045"
+INK = "#1f2937"
+BG = "#0b0b0c" if st.get_option("theme.base") == "dark" else "#faf7f9"
+CARD = "#111113" if st.get_option("theme.base") == "dark" else "#ffffff"
 
-    Nội dung file Word:
-    ---
-    {doc_text}
+# 5) Timezone hiển thị
+def now_vn():
+    # streamlit server thường UTC, chỉ format HH:MM cho gọn
+    return datetime.utcnow().strftime("%H:%M")
+
+# =========================
+# ---- STYLES & HEADER ----
+# =========================
+st.set_page_config(page_title=APP_TITLE, page_icon="💬", layout="centered")
+
+CUSTOM_CSS = f"""
+<style>
+:root {{
+  --agri-red: {AGRI_RED};
+  --agri-green: {AGRI_GREEN};
+  --ink: {INK};
+  --bg: {BG};
+  --card: {CARD};
+  --radius: 16px;
+}}
+/* App wrapper */
+.block-container {{
+  padding-top: 1rem !important;
+}}
+
+/* Top bar */
+.header {{
+  display: grid; grid-template-columns: 56px auto; gap: 12px;
+  align-items: center; background: var(--card); border: 1px solid #00000020;
+  border-radius: var(--radius); padding: 12px 14px; margin-bottom: 10px;
+  box-shadow: 0 6px 22px rgba(0,0,0,.08);
+}}
+.logo {{
+  width: 46px; height: 46px; border-radius: 12px; display: grid; place-items: center;
+  background: radial-gradient(60% 60% at 50% 40%, #9b2044 0%, var(--agri-red) 60%, #5f0e28 100%);
+  color: #fff; font-weight: 700;
+}}
+.title-wrap {{
+  display: flex; flex-direction: column; gap: 2px;
+}}
+.h1 {{
+  font-weight: 800; font-size: clamp(18px, 1.4vw + 14px, 26px);
+  color: var(--agri-red); line-height: 1.1; letter-spacing: .2px;
+}}
+.subtitle {{
+  font-size: 13px; color: #6b7280;
+}}
+
+/* Chat bubbles */
+.chat-area {{
+  background: transparent;
+}}
+.msg {{
+  display: flex; gap: 10px; margin: 10px 0;
+}}
+.msg .avatar {{
+  flex: 0 0 36px; width: 36px; height: 36px; border-radius: 50%;
+  display: grid; place-items: center; font-weight: 700; color: #fff;
+}}
+.msg.user .avatar {{ background: #374151; }}
+.msg.bot .avatar {{ background: var(--agri-red); }}
+.bubble {{
+  max-width: 90%; padding: 10px 12px; border-radius: 14px;
+  border: 1px solid #00000015; font-size: 15px; line-height: 1.45;
+}}
+.msg.user .bubble {{
+  background: #11182715; color: var(--ink); border-top-left-radius: 4px;
+}}
+.msg.bot .bubble {{
+  background: var(--card); color: var(--ink); border-top-right-radius: 4px;
+}}
+
+/* Input row */
+.input-wrap {{
+  position: sticky; bottom: 0; background: transparent;
+  padding-top: 8px; backdrop-filter: blur(4px);
+}}
+.disclaimer {{
+  font-size: 12px; color: #6b7280; margin-top: 6px;
+}}
+
+/* Footer */
+.footer {{
+  margin-top: 18px; font-size: 12px; color: #9ca3af; text-align: center;
+}}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ==========================
+# ---- SESSION & STATE  ----
+# ==========================
+if "session_id" not in st.session_state:
+    # Khớp payload với n8n: workflow mong muốn có 'sessionId'
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "messages" not in st.session_state:
+    st.session_state.messages = [
+        {"role": "bot", "text": "Xin chào! Tôi là trợ lý tư vấn pháp luật về tiền gửi. Bạn muốn hỏi điều gì?"}
+    ]
+
+# ==========================
+# ---- UTILITIES ----------- 
+# ==========================
+def build_headers() -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if AUTH_HEADER:
+        # Chấp nhận cả 'Bearer ...' hoặc 'X-API-Key: ...'
+        if AUTH_HEADER.lower().startswith("bearer "):
+            headers["Authorization"] = AUTH_HEADER
+        elif ":" in AUTH_HEADER:
+            # e.g. "X-API-Key: XXXXX"
+            k, v = AUTH_HEADER.split(":", 1)
+            headers[k.strip()] = v.strip()
+        else:
+            headers["Authorization"] = f"Bearer {AUTH_HEADER}"
+    return headers
+
+def parse_n8n_response(resp_json: Dict[str, Any]) -> str:
     """
+    Chuẩn hóa để lấy lời đáp từ nhiều kiểu output khác nhau của n8n.
+    Ưu tiên một số key phổ biến.
+    """
+    candidates = [
+        "answer", "response", "text", "message", "output", "data", "result"
+    ]
+    # Nếu output dạng { data: { output: "..." } } cũng cố gắng lần mò.
+    # Trả về chuỗi rỗng nếu không tìm thấy.
+    def deep_get(d, keys):
+        for k in keys:
+            if isinstance(d, dict) and k in d:
+                d = d[k]
+            else:
+                return None
+        return d
 
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt
-    )
-    
-    json_str = response.text.strip().replace("```json", "").replace("```", "").strip()
-    return pd.read_json(io.StringIO(json_str), typ='series')
+    # Thử tầng 1
+    for k in candidates:
+        v = resp_json.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
+    # Thử sâu hơn
+    nested_routes = [
+        ["data", "answer"], ["data", "response"], ["data", "text"],
+        ["output", "text"], ["output", "message"], ["output", "answer"],
+        ["message", "text"], ["result", "text"],
+    ]
+    for route in nested_routes:
+        v = deep_get(resp_json, route)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
 
-# --- Hàm tính toán Chỉ số Tài chính (Yêu cầu 3) ---
-def calculate_project_metrics(df_cashflow, initial_investment, wacc):
-    """Tính toán NPV, IRR, PP, DPP."""
-    
-    cash_flows = df_cashflow['Dòng tiền thuần (CF)'].values
-    
-    # 1. NPV
-    full_cash_flows = np.insert(cash_flows, 0, -initial_investment) 
-    npv_value = npf.npv(wacc, full_cash_flows)
-    
-    # 2. IRR
-    try:
-        irr_value = npf.irr(full_cash_flows)
-    except ValueError:
-        irr_value = np.nan 
+    # Nếu workflow trả về mảng items
+    items = resp_json.get("items")
+    if isinstance(items, list) and items:
+        # Lấy trường 'json' trong items[0] nếu có
+        first = items[0]
+        if isinstance(first, dict):
+            j = first.get("json")
+            if isinstance(j, dict):
+                for k in candidates:
+                    v = j.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
 
-    # 3. PP (Payback Period - Thời gian hoàn vốn)
-    cumulative_cf = np.cumsum(full_cash_flows)
-    pp_year = np.where(cumulative_cf >= 0)[0]
-    if pp_year.size > 0:
-        pp_year = pp_year[0]
-        if pp_year == 0: 
-             pp = 0 
-        else:
-             capital_remaining = abs(cumulative_cf[pp_year-1])
-             cf_of_payback_year = cash_flows[pp_year-1]
-             pp = pp_year - 1 + (capital_remaining / cf_of_payback_year) if cf_of_payback_year != 0 else pp_year 
-    else:
-        pp = 'Không hoàn vốn'
+    # fallback: stringify gọn
+    return json.dumps(resp_json, ensure_ascii=False)[:1200]
 
-    # 4. DPP (Discounted Payback Period - Thời gian hoàn vốn có chiết khấu)
-    discount_factors = 1 / ((1 + wacc) ** np.arange(0, len(full_cash_flows)))
-    discounted_cf = full_cash_flows * discount_factors
-    cumulative_dcf = np.cumsum(discounted_cf)
-    
-    dpp_year = np.where(cumulative_dcf >= 0)[0]
-    if dpp_year.size > 0:
-        dpp_year = dpp_year[0]
-        if dpp_year == 0:
-             dpp = 0
-        else:
-             capital_remaining_d = abs(cumulative_dcf[dpp_year-1])
-             dcf_of_payback_year = discounted_cf[dpp_year] 
-             dpp = dpp_year - 1 + (capital_remaining_d / dcf_of_payback_year) if dcf_of_payback_year != 0 else dpp_year
-    else:
-        dpp = 'Không hoàn vốn'
-        
-    return npv_value, irr_value, pp, dpp
+def post_to_n8n(user_text: str, session_id: str) -> str:
+    """Gửi chatInput + sessionId tới n8n và nhận câu trả lời."""
+    if not N8N_WEBHOOK_URL:
+        return "⚠️ Chưa cấu hình N8N_CHAT_WEBHOOK_URL."
 
-# --- Hàm gọi AI phân tích chỉ số (Yêu cầu 4) ---
-def get_ai_evaluation(metrics_data, wacc_rate, api_key):
-    """Gửi các chỉ số đánh giá dự án đến Gemini API và nhận phân tích."""
-    
-    if not api_key:
-        return "Lỗi: Khóa API không được cung cấp."
+    payload = {
+        "chatInput": user_text,
+        "sessionId": session_id,
+    }
+    headers = build_headers()
 
     try:
-        client = genai.Client(api_key=api_key)
-        model_name = 'gemini-2.5-flash'  
+        res = requests.post(N8N_WEBHOOK_URL, headers=headers, json=payload, timeout=60)
+        if res.status_code >= 400:
+            return f"⚠️ Lỗi webhook {res.status_code}: {res.text[:200]}"
+        data = res.json() if "application/json" in res.headers.get("Content-Type", "") else {"text": res.text}
+        answer = parse_n8n_response(data)
+        return answer or "⚠️ Không nhận được câu trả lời hợp lệ từ n8n."
+    except requests.exceptions.RequestException as e:
+        return f"⚠️ Kết nối n8n thất bại: {e}"
 
-        prompt = f"""
-        Bạn là một chuyên gia phân tích dự án đầu tư có kinh nghiệm. Dựa trên các chỉ số hiệu quả dự án sau, hãy đưa ra nhận xét ngắn gọn, khách quan (khoảng 3-4 đoạn) về khả năng chấp nhận và rủi ro của dự án. 
-        
-        Các chỉ số cần phân tích:
-        - NPV: {metrics_data['NPV']:.2f}
-        - IRR: {metrics_data['IRR']:.2%}
-        - WACC (Tỷ lệ chiết khấu): {wacc_rate:.2%}
-        - PP (Thời gian hoàn vốn): {metrics_data['PP']} năm
-        - DPP (Thời gian hoàn vốn có chiết khấu): {metrics_data['DPP']} năm
-        
-        Chú ý:
-        1. Đánh giá tính khả thi (NPV > 0 và IRR > WACC).
-        2. Nhận xét về tốc độ hoàn vốn (PP và DPP).
-        3. Kết luận tổng thể về việc chấp nhận hay từ chối dự án.
+# ==========================
+# ---- HEADER (brand)  -----
+# ==========================
+with st.container():
+    st.markdown(
         """
+        <div class="header">
+          <div class="logo">A</div>
+          <div class="title-wrap">
+            <div class="h1">CHUYÊN GIA TƯ VẤN PHÁP LUẬT VỀ TIỀN GỬI</div>
+            <div class="subtitle">""" + APP_BRAND + """ · Tư vấn theo dữ liệu đã cung cấp</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt
+# ==========================
+# ---- CHAT HISTORY --------
+# ==========================
+chat_area = st.container()
+with chat_area:
+    st.markdown('<div class="chat-area">', unsafe_allow_html=True)
+    for m in st.session_state.messages:
+        role = m.get("role", "bot")
+        text = m.get("text", "")
+        when = m.get("when", now_vn())
+        if role == "user":
+            st.markdown(
+                f"""
+                <div class="msg user">
+                  <div class="avatar">U</div>
+                  <div>
+                    <div class="bubble">{text}</div>
+                    <div style="font-size:11px;color:#9ca3af;margin-top:2px;">{when}</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+        else:  # bot
+            st.markdown(
+                f"""
+                <div class="msg bot">
+                  <div class="avatar">A</div>
+                  <div>
+                    <div class="bubble">{text}</div>
+                    <div style="font-size:11px;color:#9ca3af;margin-top:2px;">{when}</div>
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ==========================
+# ---- INPUT AREA ----------
+# ==========================
+with st.container():
+    st.markdown('<div class="input-wrap">', unsafe_allow_html=True)
+    with st.form("chat_form", clear_on_submit=True):
+        user_text = st.text_input(
+            "Nhập câu hỏi pháp luật về tiền gửi…",
+            placeholder="Ví dụ: Quy định lãi suất không kỳ hạn hiện hành? Quyền và nghĩa vụ của người gửi tiền?",
+            label_visibility="collapsed",
         )
-        return response.text
+        submitted = st.form_submit_button("Gửi", use_container_width=True)
+    st.markdown(
+        '<div class="disclaimer">* Trợ lý chỉ tư vấn dựa trên dữ liệu đã nạp vào hệ thống. '
+        'Vui lòng kiểm tra văn bản pháp luật hiện hành khi áp dụng thực tế.</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    except APIError as e:
-        return f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API. Chi tiết lỗi: {e}"
-    except Exception as e:
-        return f"Đã xảy ra lỗi không xác định: {e}"
+if submitted and user_text.strip():
+    # append user message
+    st.session_state.messages.append({"role": "user", "text": user_text.strip(), "when": now_vn()})
+    with st.spinner("Đang xử lý…"):
+        bot_reply = post_to_n8n(user_text.strip(), st.session_state.session_id)
+        # append bot message
+        st.session_state.messages.append({"role": "bot", "text": bot_reply, "when": now_vn()})
+        st.rerun()
 
-# --- Giao diện và Luồng chính ---
-
-# Lấy API Key
-api_key = st.secrets.get("GEMINI_API_KEY")
-
-if not api_key:
-     st.error("⚠️ Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets để sử dụng chức năng AI.")
-
-uploaded_file = st.file_uploader(
-    "1. Tải file Word (.docx) chứa Phương án Kinh doanh:",
-    type=['docx']
+# ==========================
+# ---- FOOTER --------------
+# ==========================
+st.markdown(
+    f"""
+    <div class="footer">
+      <hr style="opacity:.2;margin:8px 0 12px 0" />
+      {FOOTER_TEXT}
+    </div>
+    """,
+    unsafe_allow_html=True
 )
 
-# Khởi tạo state để lưu trữ dữ liệu đã trích xuất VÀ dữ liệu người dùng đã xác nhận
-if 'extracted_data' not in st.session_state:
-    st.session_state['extracted_data'] = None
-if 'confirmed_data' not in st.session_state:
-    st.session_state['confirmed_data'] = None
-
-# --- Chức năng 1: Lọc dữ liệu bằng AI ---
-if uploaded_file is not None:
-    doc_text = read_docx_file(uploaded_file)
-    
-    if st.button("Trích xuất Dữ liệu Tài chính bằng AI 🤖"):
-        st.session_state['confirmed_data'] = None # Reset dữ liệu xác nhận khi trích xuất mới
-        if api_key:
-            with st.spinner('Đang đọc và trích xuất thông số tài chính bằng Gemini...'):
-                try:
-                    raw_data = extract_financial_data(doc_text, api_key)
-                    
-                    # ****************** Tiền xử lý dữ liệu trích xuất ******************
-                    # Đảm bảo các giá trị là float/int hợp lệ, dùng 0 nếu lỗi
-                    data_dict = {
-                        'Vốn đầu tư': float(raw_data.get('Vốn đầu tư', 0)),
-                        'Dòng đời dự án': int(raw_data.get('Dòng đời dự án', 0)),
-                        'Doanh thu hàng năm': float(raw_data.get('Doanh thu hàng năm', 0)),
-                        'Chi phí hoạt động hàng năm': float(raw_data.get('Chi phí hoạt động hàng năm', 0)),
-                        'WACC': float(raw_data.get('WACC', 0.1)),
-                        'Thuế suất': float(raw_data.get('Thuế suất', 0.2))
-                    }
-                    
-                    # Chuẩn hóa WACC và Thuế suất về dạng thập phân nếu > 1
-                    if data_dict['WACC'] > 1: data_dict['WACC'] /= 100
-                    if data_dict['Thuế suất'] > 1: data_dict['Thuế suất'] /= 100
-                    
-                    st.session_state['extracted_data'] = data_dict
-                    st.success("Trích xuất dữ liệu thành công! Vui lòng kiểm tra và xác nhận các thông số bên dưới.")
-                except Exception as e:
-                    st.error(f"Lỗi trích xuất hoặc định dạng dữ liệu: {e}")
-        else:
-            st.error("Vui lòng cung cấp Khóa API.")
-
-# --- Chức năng 2: Hiển thị và Cập nhật Thủ công ---
-if st.session_state['extracted_data'] is not None:
-    data = st.session_state['extracted_data']
-    st.subheader("2. Kiểm tra và Cập nhật Thông số Dự án (Thủ công)")
-    st.info("💡 Các thông số đã được AI trích xuất (hoặc gán giá trị mặc định) sẽ được điền vào ô bên dưới. **Vui lòng kiểm tra và sửa lại** nếu cần.")
-    
-    # Tạo Form để người dùng dễ dàng xác nhận/sửa dữ liệu
-    with st.form("data_correction_form"):
-        col1, col2, col3 = st.columns(3)
-        
-        # Cột 1: Vốn & Doanh thu
-        with col1:
-            initial_investment = st.number_input(
-                "Vốn Đầu tư (C₀) (VNĐ)", 
-                min_value=0.0, 
-                value=data['Vốn đầu tư'],
-                step=1000000.0,
-                format="%.0f"
-            )
-            annual_revenue = st.number_input(
-                "Doanh thu Hàng năm (R) (VNĐ)", 
-                min_value=0.0, 
-                value=data['Doanh thu hàng năm'],
-                step=1000000.0,
-                format="%.0f"
-            )
-
-        # Cột 2: Dòng đời & Chi phí
-        with col2:
-            # Đảm bảo Dòng đời dự án ít nhất là 1 để tránh lỗi chia cho 0
-            project_life = st.number_input(
-                "Dòng đời dự án (N) (Năm)", 
-                min_value=1, 
-                value=data['Dòng đời dự án'] if data['Dòng đời dự án'] >= 1 else 1
-            )
-            annual_cost = st.number_input(
-                "Chi phí HĐ Hàng năm (C) (VNĐ)", 
-                min_value=0.0, 
-                value=data['Chi phí hoạt động hàng năm'],
-                step=1000000.0,
-                format="%.0f"
-            )
-            
-        # Cột 3: WACC & Thuế suất
-        with col3:
-            wacc = st.number_input(
-                "WACC (k) (%)", 
-                min_value=0.01, # Đảm bảo WACC tối thiểu 1%
-                max_value=100.0, 
-                value=data['WACC'] * 100,
-                step=0.1,
-                format="%.2f"
-            ) / 100.0 # Chuyển lại về dạng thập phân
-            tax_rate = st.number_input(
-                "Thuế suất (t) (%)", 
-                min_value=0.0, 
-                max_value=100.0, 
-                value=data['Thuế suất'] * 100,
-                step=0.1,
-                format="%.2f"
-            ) / 100.0 # Chuyển lại về dạng thập phân
-        
-        # Nút xác nhận
-        submitted = st.form_submit_button("Xác nhận & Tính toán 🚀")
-        
-        if submitted:
-            if project_life <= 0 or initial_investment < 0 or wacc <= 0:
-                st.error("Lỗi: Dòng đời dự án và WACC phải lớn hơn 0 để tính toán.")
-            else:
-                st.session_state['confirmed_data'] = {
-                    'Vốn đầu tư': initial_investment,
-                    'Dòng đời dự án': project_life,
-                    'Doanh thu hàng năm': annual_revenue,
-                    'Chi phí hoạt động hàng năm': annual_cost,
-                    'WACC': wacc,
-                    'Thuế suất': tax_rate
-                }
-                # SỬA LỖI: Thay st.experimental_rerun() bằng st.rerun()
-                st.rerun() 
-
-# --- Bắt đầu tính toán (Chức năng 3, 4, 5) ---
-if st.session_state['confirmed_data'] is not None:
-    
-    # Lấy dữ liệu đã được người dùng xác nhận
-    data = st.session_state['confirmed_data']
-    initial_investment = data['Vốn đầu tư']
-    project_life = data['Dòng đời dự án']
-    annual_revenue = data['Doanh thu hàng năm']
-    annual_cost = data['Chi phí hoạt động hàng năm']
-    wacc = data['WACC']
-    tax_rate = data['Thuế suất']
-    
-    # ****************** Bảng Dòng tiền (Yêu cầu 3) ******************
-    st.subheader("3. Bảng Dòng tiền (Cash Flow)")
-    
-    # Tính Khấu hao và Dòng tiền
-    depreciation = initial_investment / project_life 
-    years = np.arange(1, project_life + 1)
-    
-    EBT = annual_revenue - annual_cost - depreciation
-    Tax = EBT * tax_rate if EBT > 0 else 0
-    EAT = EBT - Tax
-    CF = EAT + depreciation
-    
-    cashflow_data = {
-        'Năm': years,
-        'Doanh thu (R)': [annual_revenue] * project_life,
-        'Chi phí HĐ (C)': [annual_cost] * project_life,
-        'Khấu hao (D)': [depreciation] * project_life,
-        'Lợi nhuận trước thuế (EBT)': [EBT] * project_life,
-        'Thuế (Tax)': [Tax] * project_life,
-        'Lợi nhuận sau thuế (EAT)': [EAT] * project_life,
-        'Dòng tiền thuần (CF)': [CF] * project_life
-    }
-    
-    df_cashflow = pd.DataFrame(cashflow_data)
-    
-    st.dataframe(
-        df_cashflow.style.format({
-            col: '{:,.0f}' for col in df_cashflow.columns if col not in ['Năm']
-        }), 
-        use_container_width=True
-    )
-
-    st.markdown("---")
-    
-    # ****************** Tính toán Chỉ số (Yêu cầu 4) ******************
-    st.subheader("4. Các Chỉ số Đánh giá Hiệu quả Dự án")
-    
-    try:
-        npv, irr, pp, dpp = calculate_project_metrics(df_cashflow, initial_investment, wacc)
-        
-        metrics_data = {
-            'NPV': npv,
-            'IRR': irr if not np.isnan(irr) else 0,
-            'PP': pp,
-            'DPP': dpp
-        }
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("NPV (Giá trị hiện tại thuần)", f"{npv:,.0f} VNĐ", delta=("Dự án có lời" if npv > 0 else "Dự án lỗ"))
-        col2.metric("IRR (Tỷ suất sinh lời nội tại)", f"{irr:.2%}" if not np.isnan(irr) else "Không tính được")
-        col3.metric("PP (Thời gian hoàn vốn)", f"{pp:.2f} năm" if isinstance(pp, float) or isinstance(pp, np.float64) else pp)
-        col4.metric("DPP (Hoàn vốn có chiết khấu)", f"{dpp:.2f} năm" if isinstance(dpp, float) or isinstance(dpp, np.float64) else dpp)
-
-        # ****************** Phân tích AI (Yêu cầu 5) ******************
-        st.markdown("---")
-        st.subheader("5. Phân tích Hiệu quả Dự án (AI)")
-        
-        if st.button("Yêu cầu AI Phân tích Chỉ số 🧠"):
-            if api_key:
-                with st.spinner('Đang gửi dữ liệu và chờ Gemini phân tích...'):
-                    ai_result = get_ai_evaluation(metrics_data, wacc, api_key)
-                    st.markdown("**Kết quả Phân tích từ Gemini AI:**")
-                    st.info(ai_result)
-            else:
-                 st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng kiểm tra cấu hình Secrets.")
-
-    except Exception as e:
-        st.error(f"Có lỗi xảy ra khi tính toán chỉ số: {e}. Vui lòng kiểm tra lại các thông số đầu vào đã xác nhận.")
-
-# Hiển thị hướng dẫn nếu chưa tải file
-if uploaded_file is None:
-    st.info("Vui lòng tải lên file Word và nhấn nút 'Trích xuất Dữ liệu Tài chính bằng AI' để bắt đầu.")
+# ============ DIAGNOSTICS ============
+with st.expander("⚙️ Cấu hình (ẩn/hiện)"):
+    st.write("Session ID:", st.session_state.session_id)
+    st.write("Webhook URL đã cấu hình:", "✅" if bool(N8N_WEBHOOK_URL) else "❌ (chưa đặt N8N_CHAT_WEBHOOK_URL)")
+    st.caption("Bạn có thể đặt biến trong .streamlit/secrets.toml hoặc biến môi trường OS.")
